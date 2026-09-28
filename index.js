@@ -14,11 +14,12 @@ import {
     createAudioResource,
     VoiceConnectionStatus,
     entersState,
-    StreamType
+    StreamType,
+    NoSubscriberBehavior,
+    AudioPlayerStatus
 } from '@discordjs/voice';
 
 import { spawn } from 'node:child_process';
-import { Readable } from 'node:stream';
 import ffmpegPath from 'ffmpeg-static';
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -27,13 +28,15 @@ const GUILD_ID = process.env.GUILD_ID;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 
 if (!TOKEN || !CLIENT_ID || !GUILD_ID || !VOICE_CHANNEL_ID) {
-    console.error('ERRORE: controlla il file .env');
+    console.error('❌ Mancano una o più variabili nel file .env');
+    console.error('Controlla DISCORD_TOKEN, CLIENT_ID, GUILD_ID e VOICE_CHANNEL_ID.');
     process.exit(1);
 }
 
-/*
- * RADIO ITALIANE
- */
+/* =========================
+   RADIO ITALIANE
+========================= */
+
 const RADIOS = {
     rtl: 'RTL 102.5',
     rds: 'RDS',
@@ -52,6 +55,10 @@ const RADIOS = {
     birikina: 'Radio Birikina'
 };
 
+/* =========================
+   DISCORD CLIENT
+========================= */
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -59,15 +66,20 @@ const client = new Client({
     ]
 });
 
-const player = createAudioPlayer();
+const player = createAudioPlayer({
+    behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play
+    }
+});
 
 let connection = null;
 let currentRadio = null;
 let ffmpeg = null;
 
-/*
- * COMANDI SLASH
- */
+/* =========================
+   SLASH COMMANDS
+========================= */
+
 const commands = [
     new SlashCommandBuilder()
         .setName('join')
@@ -101,11 +113,11 @@ const commands = [
         .setDescription('Mostra la radio attualmente in riproduzione')
 ].map(command => command.toJSON());
 
-/*
- * REGISTRA I COMANDI SLASH
- */
-async function registerCommands() {
+/* =========================
+   REGISTRA COMANDI
+========================= */
 
+async function registerCommands() {
     const rest = new REST({
         version: '10'
     }).setToken(TOKEN);
@@ -123,15 +135,14 @@ async function registerCommands() {
     console.log('✅ Comandi slash registrati!');
 }
 
-/*
- * CERCA UNA RADIO
- * Usa Radio Browser per trovare uno stream funzionante.
- */
-async function findRadio(radioName) {
+/* =========================
+   CERCA RADIO
+========================= */
 
+async function findRadio(radioName) {
     const url =
         'https://de1.api.radio-browser.info/json/stations/search' +
-        `?countrycode=IT` +
+        '?countrycode=IT' +
         `&name=${encodeURIComponent(radioName)}` +
         '&limit=20' +
         '&hidebroken=true' +
@@ -146,34 +157,32 @@ async function findRadio(radioName) {
 
     if (!response.ok) {
         throw new Error(
-            `Radio Browser ha restituito HTTP ${response.status}`
+            `Radio Browser HTTP ${response.status}`
         );
     }
 
     const stations = await response.json();
 
-    const workingStations = stations.filter(
-        station =>
-            station.url_resolved &&
-            /^https?:\/\//i.test(station.url_resolved)
+    const workingStations = stations.filter(station =>
+        station.url_resolved &&
+        /^https?:\/\//i.test(station.url_resolved)
     );
 
     if (workingStations.length === 0) {
         throw new Error(
-            `Non ho trovato uno stream per ${radioName}`
+            `Nessuno stream trovato per ${radioName}`
         );
     }
 
     return workingStations[0];
 }
 
-/*
- * FERMA FFMPEG
- */
+/* =========================
+   FERMA FFMPEG
+========================= */
+
 function stopFFmpeg() {
-
     if (ffmpeg) {
-
         try {
             ffmpeg.kill('SIGKILL');
         } catch {}
@@ -182,12 +191,14 @@ function stopFFmpeg() {
     }
 }
 
-/*
- * CREA AUDIO RESOURCE
- */
-function createRadioResource(streamUrl) {
+/* =========================
+   CREA AUDIO RESOURCE
+========================= */
 
+function createRadioResource(streamUrl) {
     stopFFmpeg();
+
+    console.log('🎧 Avvio FFmpeg...');
 
     ffmpeg = spawn(
         ffmpegPath,
@@ -240,66 +251,56 @@ function createRadioResource(streamUrl) {
     );
 
     ffmpeg.stderr.on('data', data => {
-
-        const message = data
-            .toString()
-            .trim();
+        const message = data.toString().trim();
 
         if (message) {
             console.log('[FFmpeg]', message);
         }
     });
 
-    const audioStream = Readable.from(
-        ffmpeg.stdout
-    );
+    ffmpeg.on('error', error => {
+        console.error('❌ Errore FFmpeg:', error.message);
+    });
+
+    ffmpeg.on('close', code => {
+        console.log(`ℹ️ FFmpeg terminato. Codice: ${code}`);
+
+        if (currentRadio) {
+            console.log('🔄 Tentativo di riavvio della radio...');
+
+            setTimeout(() => {
+                if (currentRadio) {
+                    playRadio(currentRadio).catch(error => {
+                        console.error(
+                            '❌ Errore riavvio radio:',
+                            error.message
+                        );
+                    });
+                }
+            }, 5000);
+        }
+    });
 
     return createAudioResource(
-        audioStream,
+        ffmpeg.stdout,
         {
             inputType: StreamType.OggOpus
         }
     );
 }
 
-    ffmpeg.stderr.on('data', data => {
+/* =========================
+   OTTIENI CANALE VOCALE
+========================= */
 
-        const message = data
-            .toString()
-            .trim();
-
-        if (message) {
-            console.log('[FFmpeg]', message);
-        }
-    });
-
-    const audioStream = Readable.from(
-        ffmpeg.stdout
-    );
-
-    return createAudioResource(
-        audioStream,
-        {
-            inputType: StreamType.Raw
-        }
-    );
-}
-
-/*
- * TROVA IL CANALE VOCALE
- */
 async function getVoiceChannel() {
-
-    const guild = await client.guilds.fetch(
-        GUILD_ID
-    );
+    const guild = await client.guilds.fetch(GUILD_ID);
 
     const channel = await guild.channels.fetch(
         VOICE_CHANNEL_ID
     );
 
     if (!channel || !channel.isVoiceBased()) {
-
         throw new Error(
             'VOICE_CHANNEL_ID non è un canale vocale valido.'
         );
@@ -308,36 +309,33 @@ async function getVoiceChannel() {
     return channel;
 }
 
-/*
- * ENTRA NEL CANALE VOCALE
- */
-async function connectToVoice() {
+/* =========================
+   CONNETTI AL VOCALE
+========================= */
 
+async function connectToVoice() {
     const channel = await getVoiceChannel();
 
     if (
         connection &&
-        connection.state.status !==
-        VoiceConnectionStatus.Destroyed
+        connection.state.status !== VoiceConnectionStatus.Destroyed
     ) {
         return connection;
     }
 
     connection = joinVoiceChannel({
-
         channelId: channel.id,
-
         guildId: channel.guild.id,
-
-        adapterCreator:
-            channel.guild.voiceAdapterCreator,
-
+        adapterCreator: channel.guild.voiceAdapterCreator,
         selfDeaf: true,
-
         selfMute: false
     });
 
     connection.subscribe(player);
+
+    console.log(
+        `🎙️ Connessione a: ${channel.name}`
+    );
 
     connection.on(
         VoiceConnectionStatus.Ready,
@@ -351,20 +349,17 @@ async function connectToVoice() {
     connection.on(
         VoiceConnectionStatus.Disconnected,
         async () => {
-
             console.log(
                 '⚠️ Connessione vocale persa...'
             );
 
             try {
-
                 await Promise.race([
                     entersState(
                         connection,
                         VoiceConnectionStatus.Signalling,
                         5000
                     ),
-
                     entersState(
                         connection,
                         VoiceConnectionStatus.Connecting,
@@ -372,7 +367,13 @@ async function connectToVoice() {
                     )
                 ]);
 
+                console.log(
+                    '✅ Connessione vocale recuperata.'
+                );
             } catch {
+                console.log(
+                    '🔄 Riconnessione al canale vocale...'
+                );
 
                 try {
                     connection.destroy();
@@ -380,10 +381,9 @@ async function connectToVoice() {
 
                 connection = null;
 
-                setTimeout(
-                    reconnect,
-                    5000
-                );
+                setTimeout(() => {
+                    reconnect();
+                }, 5000);
             }
         }
     );
@@ -391,100 +391,121 @@ async function connectToVoice() {
     return connection;
 }
 
-/*
- * RICONNESSIONE AUTOMATICA
- */
+/* =========================
+   RICONNESSIONE
+========================= */
+
 async function reconnect() {
-
     try {
-
-        console.log(
-            '🔄 Tentativo di riconnessione...'
-        );
-
         await connectToVoice();
 
+        console.log(
+            '✅ Riconnesso al canale vocale.'
+        );
+
         if (currentRadio) {
-
-            await playRadio(
-                currentRadio
-            );
+            await playRadio(currentRadio);
         }
-
     } catch (error) {
-
         console.error(
-            'Errore riconnessione:',
+            '❌ Riconnessione fallita:',
             error.message
         );
 
-        setTimeout(
-            reconnect,
-            5000
-        );
+        setTimeout(() => {
+            reconnect();
+        }, 5000);
     }
 }
 
-/*
- * RIPRODUCI RADIO
- */
+/* =========================
+   RIPRODUCI RADIO
+========================= */
+
 async function playRadio(radioKey) {
-
     if (!RADIOS[radioKey]) {
-
         throw new Error(
-            'Radio non trovata.'
+            `Radio "${radioKey}" non trovata.`
         );
     }
 
-    const radioName =
-        RADIOS[radioKey];
+    const radioName = RADIOS[radioKey];
 
     console.log(
         `🔎 Cerco ${radioName}...`
     );
 
-    const station =
-        await findRadio(
-            radioName
-        );
+    const station = await findRadio(
+        radioName
+    );
 
     console.log(
         `📻 Stream trovato: ${station.url_resolved}`
     );
 
-    const resource =
-        createRadioResource(
-            station.url_resolved
-        );
+    if (!connection) {
+        await connectToVoice();
+    }
+
+    const resource = createRadioResource(
+        station.url_resolved
+    );
+
+    currentRadio = radioKey;
 
     player.play(resource);
 
-    currentRadio =
-        radioKey;
-
-    if (connection) {
-        connection.subscribe(player);
-    }
+    connection.subscribe(player);
 
     console.log(
         `📻 Ora in riproduzione: ${radioName}`
     );
 }
 
-/*
- * BOT ONLINE
- */
+/* =========================
+   STATO PLAYER
+========================= */
+
+player.on(
+    AudioPlayerStatus.Playing,
+    () => {
+        console.log(
+            '🔊 Audio in riproduzione.'
+        );
+    }
+);
+
+player.on(
+    AudioPlayerStatus.Idle,
+    () => {
+        console.log(
+            '⏸️ Player audio inattivo.'
+        );
+    }
+);
+
+player.on(
+    'error',
+    error => {
+        console.error(
+            '❌ Errore AudioPlayer:',
+            error.message
+        );
+    }
+);
+
+/* =========================
+   BOT ONLINE
+========================= */
+
 client.once(
     'ready',
     async () => {
-
         console.log(
             `🤖 Bot online: ${client.user.tag}`
         );
 
         try {
-
             await registerCommands();
 
             console.log(
@@ -494,50 +515,43 @@ client.once(
             await connectToVoice();
 
         } catch (error) {
-
             console.error(
-                'Errore avvio:',
-                error
+                '❌ Errore durante l'avvio:',
+                error.message
             );
 
-            reconnect();
+            setTimeout(() => {
+                reconnect();
+            }, 5000);
         }
     }
 );
 
-/*
- * INTERAZIONI
- */
+/* =========================
+   INTERAZIONI
+========================= */
+
 client.on(
     'interactionCreate',
     async interaction => {
 
-        /*
-         * AUTOCOMPLETE
-         */
+        /* AUTOCOMPLETE */
+
         if (interaction.isAutocomplete()) {
+            const search = interaction.options
+                .getFocused()
+                .toLowerCase();
 
-            const search =
-                interaction.options
-                    .getFocused()
-                    .toLowerCase();
-
-            const choices =
-                Object.entries(RADIOS)
-                    .filter(
-                        ([key, name]) =>
-                            key.includes(search) ||
-                            name
-                                .toLowerCase()
-                                .includes(search)
-                    )
-                    .slice(0, 25)
-                    .map(
-                        ([key, name]) => ({
-                            name,
-                            value: key
-                        })
-                    );
+            const choices = Object.entries(RADIOS)
+                .filter(([key, name]) =>
+                    key.includes(search) ||
+                    name.toLowerCase().includes(search)
+                )
+                .slice(0, 25)
+                .map(([key, name]) => ({
+                    name,
+                    value: key
+                }));
 
             await interaction.respond(
                 choices
@@ -546,25 +560,15 @@ client.on(
             return;
         }
 
-        /*
-         * SOLO COMANDI SLASH
-         */
-        if (
-            !interaction.isChatInputCommand()
-        ) {
+        if (!interaction.isChatInputCommand()) {
             return;
         }
 
         try {
 
-            /*
-             * JOIN
-             */
-            if (
-                interaction.commandName ===
-                'join'
-            ) {
+            /* JOIN */
 
+            if (interaction.commandName === 'join') {
                 await connectToVoice();
 
                 await interaction.reply(
@@ -574,22 +578,16 @@ client.on(
                 return;
             }
 
-            /*
-             * LEAVE
-             */
-            if (
-                interaction.commandName ===
-                'leave'
-            ) {
+            /* LEAVE */
+
+            if (interaction.commandName === 'leave') {
+                currentRadio = null;
 
                 stopFFmpeg();
 
                 player.stop();
 
-                currentRadio = null;
-
                 if (connection) {
-
                     try {
                         connection.destroy();
                     } catch {}
@@ -604,21 +602,18 @@ client.on(
                 return;
             }
 
-            /*
-             * LISTA RADIO
-             */
+            /* RADIO LIST */
+
             if (
                 interaction.commandName ===
                 'radio-list'
             ) {
-
-                const list =
-                    Object.entries(RADIOS)
-                        .map(
-                            ([key, name]) =>
-                                `\`/radio ${key}\` — ${name}`
-                        )
-                        .join('\n');
+                const list = Object.entries(RADIOS)
+                    .map(
+                        ([key, name]) =>
+                            `\`/radio ${key}\` — ${name}`
+                    )
+                    .join('\n');
 
                 await interaction.reply(
                     `📻 **Radio disponibili:**\n\n${list}`
@@ -627,14 +622,12 @@ client.on(
                 return;
             }
 
-            /*
-             * RADIO
-             */
+            /* RADIO */
+
             if (
                 interaction.commandName ===
                 'radio'
             ) {
-
                 const radioKey =
                     interaction.options.getString(
                         'nome',
@@ -642,10 +635,6 @@ client.on(
                     );
 
                 await interaction.deferReply();
-
-                if (!connection) {
-                    await connectToVoice();
-                }
 
                 await playRadio(
                     radioKey
@@ -658,14 +647,12 @@ client.on(
                 return;
             }
 
-            /*
-             * STOP
-             */
+            /* STOP */
+
             if (
                 interaction.commandName ===
                 'stop'
             ) {
-
                 stopFFmpeg();
 
                 player.stop();
@@ -679,16 +666,13 @@ client.on(
                 return;
             }
 
-            /*
-             * NOW PLAYING
-             */
+            /* NOW PLAYING */
+
             if (
                 interaction.commandName ===
                 'nowplaying'
             ) {
-
                 if (!currentRadio) {
-
                     await interaction.reply(
                         '🔇 Nessuna radio in riproduzione.'
                     );
@@ -702,26 +686,22 @@ client.on(
             }
 
         } catch (error) {
-
             console.error(
-                'Errore comando:',
+                '❌ Errore comando:',
                 error
             );
 
             const message =
-                '❌ Si è verificato un errore. Controlla il terminale.';
+                '❌ Si è verificato un errore. Controlla la console.';
 
             if (
                 interaction.deferred ||
                 interaction.replied
             ) {
-
                 await interaction
                     .editReply(message)
                     .catch(() => {});
-
             } else {
-
                 await interaction
                     .reply({
                         content: message,
@@ -733,14 +713,15 @@ client.on(
     }
 );
 
-/*
- * ERRORI GLOBALI
- */
+/* =========================
+   ERRORI GLOBALI
+========================= */
+
 process.on(
     'unhandledRejection',
     error => {
         console.error(
-            'Unhandled Rejection:',
+            '❌ Unhandled Rejection:',
             error
         );
     }
@@ -750,13 +731,14 @@ process.on(
     'uncaughtException',
     error => {
         console.error(
-            'Uncaught Exception:',
+            '❌ Uncaught Exception:',
             error
         );
     }
 );
 
-/*
- * AVVIA BOT
- */
+/* =========================
+   LOGIN
+========================= */
+
 client.login(TOKEN);
