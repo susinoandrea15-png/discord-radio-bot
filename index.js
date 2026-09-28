@@ -198,13 +198,10 @@ function createRadioResource(streamUrl) {
 
             '-reconnect',
             '1',
-
             '-reconnect_streamed',
             '1',
-
             '-reconnect_at_eof',
             '1',
-
             '-reconnect_delay_max',
             '10',
 
@@ -212,50 +209,34 @@ function createRadioResource(streamUrl) {
             streamUrl,
 
             '-vn',
-
             '-c:a',
             'libopus',
-
             '-b:a',
             '128k',
-
             '-ar',
             '48000',
-
             '-ac',
             '2',
-
             '-f',
             'ogg',
 
             'pipe:1'
         ],
         {
-            stdio: [
-                'ignore',
-                'pipe',
-                'pipe'
-            ]
+            stdio: ['ignore', 'pipe', 'pipe']
         }
     );
 
     ffmpeg.stderr.on('data', data => {
-
-        const message = data
-            .toString()
-            .trim();
+        const message = data.toString().trim();
 
         if (message) {
             console.log('[FFmpeg]', message);
         }
     });
 
-    const audioStream = Readable.from(
-        ffmpeg.stdout
-    );
-
     return createAudioResource(
-        audioStream,
+        ffmpeg.stdout,
         {
             inputType: StreamType.OggOpus
         }
